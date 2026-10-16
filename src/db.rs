@@ -12,7 +12,11 @@ pub struct DbStore {
 
 impl DbStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let log_path = path.as_ref().join("db.log");
+        let path_ref = path.as_ref();
+
+        std::fs::create_dir_all(path_ref)?;
+
+        let log_path = path_ref.join("db.log");
         let mut log = LogManager::open(log_path)?;
         let mut index = KeyIndex::new();
 
