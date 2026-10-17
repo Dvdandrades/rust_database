@@ -1,8 +1,7 @@
-pub mod db;
+pub mod engine;
 pub mod error;
-pub mod index;
-pub mod log;
-pub mod record;
+pub mod model;
+pub mod storage;
 
-pub use db::DbStore;
+pub use engine::db::DbStore;
 pub use error::{DbError, Result};

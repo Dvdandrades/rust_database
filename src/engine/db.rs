@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use crate::error::{DbError, Result};
-use crate::index::KeyIndex;
-use crate::log::LogManager;
-use crate::record::{Record, RecordType};
+use crate::model::record::{Record, RecordType};
+use crate::storage::index::KeyIndex;
+use crate::storage::log::LogManager;
 
 pub struct DbStore {
     log: LogManager,

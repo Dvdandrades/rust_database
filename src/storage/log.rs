@@ -3,7 +3,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::error::Result;
-use crate::record::Record;
+use crate::model::record::Record;
 
 pub struct LogManager {
     file: File,
@@ -76,7 +76,7 @@ impl LogManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::Record;
+    use crate::model::record::Record;
     use std::env;
 
     #[test]

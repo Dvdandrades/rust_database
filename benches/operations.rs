@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use rust_database::{DbStore, db};
+use rust_database::DbStore;
 use std::hint::black_box;
 use tempfile::tempdir;
 
