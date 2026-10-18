@@ -17,8 +17,8 @@ impl DbStore {
         std::fs::create_dir_all(path_ref)?;
 
         let log_path = path_ref.join("db.log");
-        let mut log = LogManager::open(log_path)?;
-        let mut index = KeyIndex::new();
+        let log = LogManager::open(log_path)?;
+        let index = KeyIndex::new();
 
         let records = log.read_all()?;
         for (pos, record) in records {
@@ -40,19 +40,18 @@ impl DbStore {
         Ok(Self { log, index })
     }
 
-    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+    pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         let record = Record::new_put(key.clone(), value);
         let serialized = record.serialize()?;
         let size = (4 + serialized.len()) as u32;
 
         let pos = self.log.append(&record)?;
-
         self.index.insert(key, pos, size);
 
         Ok(())
     }
 
-    pub fn get(&mut self, key: &[u8]) -> Result<Vec<u8>> {
+    pub fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
         let entry = self.index.get(key).ok_or(DbError::KeyNotFound)?;
 
         let record = self.log.read_at(entry.offset)?;
@@ -64,14 +63,13 @@ impl DbStore {
         }
     }
 
-    pub fn delete(&mut self, key: Vec<u8>) -> Result<()> {
+    pub fn delete(&self, key: Vec<u8>) -> Result<()> {
         if self.index.get(&key).is_none() {
             return Err(DbError::KeyNotFound);
         }
 
         let record = Record::new_delete(key.clone());
         self.log.append(&record)?;
-
         self.index.remove(&key);
 
         Ok(())
@@ -81,12 +79,14 @@ impl DbStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
     use tempfile::tempdir;
 
     #[test]
     fn test_put_and_get() -> Result<()> {
         let dir = tempdir().unwrap();
-        let mut db = DbStore::open(dir.path())?;
+        let db = DbStore::open(dir.path())?;
 
         let key = b"hello".to_vec();
         let value = b"world".to_vec();
@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn test_get_non_existent() -> Result<()> {
         let dir = tempdir().unwrap();
-        let mut db = DbStore::open(dir.path())?;
+        let db = DbStore::open(dir.path())?;
 
         let result = db.get(b"missing_key");
         assert!(matches!(result, Err(DbError::KeyNotFound)));
@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn test_delete() -> Result<()> {
         let dir = tempdir().unwrap();
-        let mut db = DbStore::open(dir.path())?;
+        let db = DbStore::open(dir.path())?;
 
         let key = b"session_id".to_vec();
         let value = b"12345".to_vec();
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn test_delete_non_existent() -> Result<()> {
         let dir = tempdir().unwrap();
-        let mut db = DbStore::open(dir.path())?;
+        let db = DbStore::open(dir.path())?;
 
         let result = db.delete(b"phantom_key".to_vec());
         assert!(matches!(result, Err(DbError::KeyNotFound)));
@@ -143,20 +143,58 @@ mod tests {
         let path = dir.path().to_path_buf();
 
         {
-            let mut db = DbStore::open(&path)?;
+            let db = DbStore::open(&path)?;
             db.put(b"user_1".to_vec(), b"David".to_vec())?;
             db.put(b"user_2".to_vec(), b"Ana".to_vec())?;
             db.delete(b"user_1".to_vec())?;
         }
 
         {
-            let mut db = DbStore::open(&path)?;
+            let db = DbStore::open(&path)?;
 
             assert!(matches!(db.get(b"user_1"), Err(DbError::KeyNotFound)));
 
             let val = db.get(b"user_2")?;
             assert_eq!(val, b"Ana".to_vec());
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_concurrent_reads_and_writes() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(DbStore::open(dir.path())?);
+
+        db.put(b"shared_key".to_vec(), b"initial_value".to_vec())?;
+
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let db_clone = Arc::clone(&db);
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    let val = db_clone.get(b"shared_key");
+                    assert!(val.is_ok());
+                }
+            }));
+        }
+
+        let db_writer = Arc::clone(&db);
+        handles.push(thread::spawn(move || {
+            for i in 0..50 {
+                let key = format!("key_{}", i).into_bytes();
+                let val = format!("val_{}", i).into_bytes();
+                let _ = db_writer.put(key, val);
+            }
+        }));
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let val = db.get(b"shared_key")?;
+        assert_eq!(val, b"initial_value".to_vec());
 
         Ok(())
     }

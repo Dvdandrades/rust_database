@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 #[derive(Debug, Clone, Copy)]
 pub struct KeyDirEntry {
@@ -7,30 +8,34 @@ pub struct KeyDirEntry {
 }
 
 pub struct KeyIndex {
-    index: HashMap<Vec<u8>, KeyDirEntry>,
+    index: RwLock<HashMap<Vec<u8>, KeyDirEntry>>,
 }
 
 impl KeyIndex {
     pub fn new() -> Self {
         Self {
-            index: HashMap::new(),
+            index: RwLock::new(HashMap::new()),
         }
     }
 
-    pub fn insert(&mut self, key: Vec<u8>, offset: u64, size: u32) {
-        self.index.insert(key, KeyDirEntry { offset, size });
+    pub fn insert(&self, key: Vec<u8>, offset: u64, size: u32) {
+        let mut guard = self.index.write().unwrap();
+        guard.insert(key, KeyDirEntry { offset, size });
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<&KeyDirEntry> {
-        self.index.get(key)
+    pub fn get(&self, key: &[u8]) -> Option<KeyDirEntry> {
+        let guard = self.index.read().unwrap();
+        guard.get(key).copied()
     }
 
-    pub fn remove(&mut self, key: &[u8]) -> Option<KeyDirEntry> {
-        self.index.remove(key)
+    pub fn remove(&self, key: &[u8]) -> Option<KeyDirEntry> {
+        let mut guard = self.index.write().unwrap();
+        guard.remove(key)
     }
 
-    pub fn clear(&mut self) {
-        self.index.clear();
+    pub fn clear(&self) {
+        let mut guard = self.index.write().unwrap();
+        guard.clear();
     }
 }
 
@@ -55,7 +60,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_get() {
-        let mut index = KeyIndex::new();
+        let index = KeyIndex::new();
         let key = b"my_key".to_vec();
 
         index.insert(key.clone(), 100, 42);
@@ -70,7 +75,7 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let mut index = KeyIndex::new();
+        let index = KeyIndex::new();
         let key = b"removable_key".to_vec();
 
         index.insert(key.clone(), 50, 10);
@@ -89,7 +94,7 @@ mod tests {
 
     #[test]
     fn test_clear() {
-        let mut index = KeyIndex::new();
+        let index = KeyIndex::new();
         index.insert(b"key1".to_vec(), 10, 5);
         index.insert(b"key2".to_vec(), 20, 10);
 

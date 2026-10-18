@@ -1,12 +1,13 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Mutex;
 
 use crate::error::Result;
 use crate::model::record::Record;
 
 pub struct LogManager {
-    file: File,
+    file: Mutex<File>,
 }
 
 impl LogManager {
@@ -17,43 +18,48 @@ impl LogManager {
             .append(true)
             .open(path)?;
 
-        Ok(Self { file })
+        Ok(Self {
+            file: Mutex::new(file),
+        })
     }
 
-    pub fn append(&mut self, record: &Record) -> Result<u64> {
+    pub fn append(&self, record: &Record) -> Result<u64> {
         let bytes = record.serialize()?;
+        let mut file = self.file.lock().unwrap();
 
-        let pos = self.file.seek(SeekFrom::End(0))?;
+        let pos = file.seek(SeekFrom::End(0))?;
 
         let len = bytes.len() as u32;
-        self.file.write_all(&len.to_le_bytes())?;
-        self.file.write_all(&bytes)?;
-        self.file.flush()?;
+        file.write_all(&len.to_le_bytes())?;
+        file.write_all(&bytes)?;
+        file.flush()?;
 
         Ok(pos)
     }
 
-    pub fn read_at(&mut self, offset: u64) -> Result<Record> {
-        self.file.seek(SeekFrom::Start(offset))?;
+    pub fn read_at(&self, offset: u64) -> Result<Record> {
+        let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::Start(offset))?;
 
         let mut len_bytes = [0u8; 4];
-        self.file.read_exact(&mut len_bytes)?;
+        file.read_exact(&mut len_bytes)?;
         let len = u32::from_le_bytes(len_bytes) as usize;
 
         let mut buffer = vec![0u8; len];
-        self.file.read_exact(&mut buffer)?;
+        file.read_exact(&mut buffer)?;
 
         Record::deserialize(&buffer)
     }
 
-    pub fn read_all(&mut self) -> Result<Vec<(u64, Record)>> {
-        self.file.seek(SeekFrom::Start(0))?;
+    pub fn read_all(&self) -> Result<Vec<(u64, Record)>> {
+        let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::Start(0))?;
         let mut records = Vec::new();
         let mut pos = 0u64;
 
         loop {
             let mut len_bytes = [0u8; 4];
-            match self.file.read_exact(&mut len_bytes) {
+            match file.read_exact(&mut len_bytes) {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e.into()),
@@ -61,7 +67,7 @@ impl LogManager {
 
             let len = u32::from_le_bytes(len_bytes) as usize;
             let mut buffer = vec![0u8; len];
-            self.file.read_exact(&mut buffer)?;
+            file.read_exact(&mut buffer)?;
 
             let record = Record::deserialize(&buffer)?;
             records.push((pos, record));
@@ -87,7 +93,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         {
-            let mut log_manager = LogManager::open(&path).unwrap();
+            let log_manager = LogManager::open(&path).unwrap();
 
             let record1 = Record::new_put(b"key1".to_vec(), b"value1".to_vec());
             let record2 = Record::new_delete(b"key2".to_vec());
@@ -117,7 +123,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         {
-            let mut log_manager = LogManager::open(&path).unwrap();
+            let log_manager = LogManager::open(&path).unwrap();
             let all_records = log_manager.read_all().unwrap();
             assert!(all_records.is_empty());
         }

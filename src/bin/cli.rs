@@ -20,7 +20,7 @@ fn main() {
     let command = &args[1];
     let db_path = "data.db";
 
-    let mut store = match DbStore::open(db_path) {
+    let store = match DbStore::open(db_path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening database: {}", e);
