@@ -3,6 +3,7 @@ use std::sync::RwLock;
 
 #[derive(Debug, Clone, Copy)]
 pub struct KeyDirEntry {
+    pub file_id: u32,
     pub offset: u64,
     pub size: u32,
 }
@@ -18,9 +19,16 @@ impl KeyIndex {
         }
     }
 
-    pub fn insert(&self, key: Vec<u8>, offset: u64, size: u32) {
+    pub fn insert(&self, key: Vec<u8>, file_id: u32, offset: u64, size: u32) {
         let mut guard = self.index.write().unwrap();
-        guard.insert(key, KeyDirEntry { offset, size });
+        guard.insert(
+            key,
+            KeyDirEntry {
+                file_id,
+                offset,
+                size,
+            },
+        );
     }
 
     pub fn get(&self, key: &[u8]) -> Option<KeyDirEntry> {
@@ -36,6 +44,11 @@ impl KeyIndex {
     pub fn clear(&self) {
         let mut guard = self.index.write().unwrap();
         guard.clear();
+    }
+
+    pub fn get_all(&self) -> Vec<(Vec<u8>, KeyDirEntry)> {
+        let guard = self.index.read().unwrap();
+        guard.iter().map(|(k, v)| (k.clone(), *v)).collect()
     }
 }
 
@@ -63,12 +76,13 @@ mod tests {
         let index = KeyIndex::new();
         let key = b"my_key".to_vec();
 
-        index.insert(key.clone(), 100, 42);
+        index.insert(key.clone(), 1, 100, 42);
 
         let entry = index.get(&key);
         assert!(entry.is_some());
 
         let entry = entry.unwrap();
+        assert_eq!(entry.file_id, 1);
         assert_eq!(entry.offset, 100);
         assert_eq!(entry.size, 42);
     }
@@ -78,13 +92,14 @@ mod tests {
         let index = KeyIndex::new();
         let key = b"removable_key".to_vec();
 
-        index.insert(key.clone(), 50, 10);
+        index.insert(key.clone(), 1, 50, 10);
         assert!(index.get(&key).is_some());
 
         let removed = index.remove(&key);
         assert!(removed.is_some());
 
         let entry = removed.unwrap();
+        assert_eq!(entry.file_id, 1);
         assert_eq!(entry.offset, 50);
         assert_eq!(entry.size, 10);
 
@@ -95,8 +110,8 @@ mod tests {
     #[test]
     fn test_clear() {
         let index = KeyIndex::new();
-        index.insert(b"key1".to_vec(), 10, 5);
-        index.insert(b"key2".to_vec(), 20, 10);
+        index.insert(b"key1".to_vec(), 1, 10, 5);
+        index.insert(b"key2".to_vec(), 1, 20, 10);
 
         assert!(index.get(b"key1").is_some());
         assert!(index.get(b"key2").is_some());

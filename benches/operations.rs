@@ -6,7 +6,7 @@ use tempfile::tempdir;
 fn bench_put_and_get(c: &mut Criterion) {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("bench.db");
-    let mut store = DbStore::open(&db_path).unwrap();
+    let store = DbStore::open(&db_path).unwrap();
 
     let mut group = c.benchmark_group("dbstore-ops");
 
