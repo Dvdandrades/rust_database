@@ -6,6 +6,21 @@ use std::path::{Path, PathBuf};
 use crate::error::Result;
 use crate::model::record::Record;
 
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
 pub struct LogManager {
     dir_path: PathBuf,
     max_file_size: u64,
@@ -64,13 +79,15 @@ impl LogManager {
     pub fn append(&mut self, record: &Record) -> Result<(u32, u64)> {
         let bytes = record.serialize()?;
         let len = bytes.len() as u32;
-        let total_len = 4 + bytes.len() as u64;
+        let checksum = crc32(&bytes);
+        let total_len = 8 + bytes.len() as u64;
 
         if self.active_file_size + total_len > self.max_file_size {
             self.rotate()?;
         }
 
         let pos = self.active_file_size;
+        self.active_file.write_all(&checksum.to_le_bytes())?;
         self.active_file.write_all(&len.to_le_bytes())?;
         self.active_file.write_all(&bytes)?;
 
@@ -118,12 +135,24 @@ impl LogManager {
 
         file.seek(SeekFrom::Start(offset))?;
 
+        let mut checksum_bytes = [0u8; 4];
+        file.read_exact(&mut checksum_bytes)?;
+        let expected_checksum = u32::from_le_bytes(checksum_bytes);
+
         let mut len_bytes = [0u8; 4];
         file.read_exact(&mut len_bytes)?;
         let len = u32::from_le_bytes(len_bytes) as usize;
 
         let mut buffer = vec![0u8; len];
         file.read_exact(&mut buffer)?;
+
+        let actual_checksum = crc32(&buffer);
+        if actual_checksum != expected_checksum {
+            return Err(crate::error::DbError::Corruption(format!(
+                "CRC32 checksum mismatch: expected {:x}, got {:x}",
+                expected_checksum, actual_checksum
+            )));
+        }
 
         Record::deserialize(&buffer)
     }
@@ -150,21 +179,48 @@ impl LogManager {
             let mut pos = 0u64;
 
             loop {
-                let mut len_bytes = [0u8; 4];
-                match file.read_exact(&mut len_bytes) {
+                let current_pos = pos;
+
+                let mut checksum_bytes = [0u8; 4];
+                match file.read_exact(&mut checksum_bytes) {
                     Ok(_) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                     Err(e) => return Err(e.into()),
                 }
 
+                let mut len_bytes = [0u8; 4];
+                match file.read_exact(&mut len_bytes) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        break;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+
+                let expected_checksum = u32::from_le_bytes(checksum_bytes);
                 let len = u32::from_le_bytes(len_bytes) as usize;
+
                 let mut buffer = vec![0u8; len];
-                file.read_exact(&mut buffer)?;
+                match file.read_exact(&mut buffer) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        break;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
 
-                let record = Record::deserialize(&buffer)?;
-                all_records.push((file_id, pos, record));
+                let actual_checksum = crc32(&buffer);
+                if actual_checksum != expected_checksum {
+                    break;
+                }
 
-                pos += 4 + len as u64;
+                let record = match Record::deserialize(&buffer) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+
+                all_records.push((file_id, current_pos, record));
+                pos += 8 + len as u64;
             }
         }
 

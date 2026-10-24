@@ -25,7 +25,7 @@ impl DbStore {
         let records = log.read_all_segments()?;
         for (file_id, pos, record) in records {
             let serialized = record.serialize()?;
-            let size = (4 + serialized.len()) as u32;
+            let size = (8 + serialized.len()) as u32;
             let rec_type = RecordType::try_from(record.recid)?;
 
             match rec_type {
@@ -49,7 +49,7 @@ impl DbStore {
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         let record = Record::new_put(key.clone(), value);
         let serialized = record.serialize()?;
-        let size = (4 + serialized.len()) as u32;
+        let size = (8 + serialized.len()) as u32;
 
         let mut log = self.log.lock().unwrap();
         let (file_id, pos) = log.append(&record)?;
@@ -103,7 +103,7 @@ impl DbStore {
         for (key, entry) in snapshot {
             let record = log_guard.read_at(entry.file_id, entry.offset)?;
             let serialized = record.serialize()?;
-            let size = (4 + serialized.len()) as u32;
+            let size = (8 + serialized.len()) as u32;
 
             let (new_file_id, new_pos) = new_log.append(&record)?;
             new_index_map.push((key, new_file_id, new_pos, size));
