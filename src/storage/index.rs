@@ -8,6 +8,12 @@ pub struct KeyDirEntry {
     pub size: u32,
 }
 
+#[derive(Debug, Clone)]
+pub enum IndexUpdate {
+    Put { key: Vec<u8>, entry: KeyDirEntry },
+    Remove { key: Vec<u8> },
+}
+
 pub struct KeyIndex {
     index: RwLock<HashMap<Vec<u8>, KeyDirEntry>>,
 }
@@ -39,6 +45,23 @@ impl KeyIndex {
     pub fn remove(&self, key: &[u8]) -> Option<KeyDirEntry> {
         let mut guard = self.index.write().unwrap();
         guard.remove(key)
+    }
+
+    pub fn apply_batch<I>(&self, updates: I)
+    where
+        I: IntoIterator<Item = IndexUpdate>,
+    {
+        let mut guard = self.index.write().unwrap();
+        for update in updates {
+            match update {
+                IndexUpdate::Put { key, entry } => {
+                    guard.insert(key, entry);
+                }
+                IndexUpdate::Remove { key } => {
+                    guard.remove(&key);
+                }
+            }
+        }
     }
 
     pub fn clear(&self) {
@@ -120,5 +143,43 @@ mod tests {
 
         assert!(index.get(b"key1").is_none());
         assert!(index.get(b"key2").is_none());
+    }
+
+    #[test]
+    fn test_apply_batch_in_order() {
+        let index = KeyIndex::new();
+        index.insert(b"old".to_vec(), 1, 0, 10);
+        index.insert(b"gone".to_vec(), 1, 10, 10);
+
+        let entry = |offset| KeyDirEntry {
+            file_id: 2,
+            offset,
+            size: 5,
+        };
+
+        index.apply_batch(vec![
+            IndexUpdate::Put {
+                key: b"k".to_vec(),
+                entry: entry(0),
+            },
+            IndexUpdate::Put {
+                key: b"k".to_vec(),
+                entry: entry(5),
+            },
+            IndexUpdate::Remove {
+                key: b"gone".to_vec(),
+            },
+            IndexUpdate::Remove {
+                key: b"never_existed".to_vec(),
+            },
+        ]);
+
+        assert_eq!(
+            index.get(b"k").unwrap().offset,
+            5,
+            "the last update must win"
+        );
+        assert!(index.get(b"gone").is_none());
+        assert_eq!(index.get(b"old").unwrap().offset, 0);
     }
 }

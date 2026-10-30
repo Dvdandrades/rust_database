@@ -6,6 +6,7 @@ use wincode::{SchemaRead, SchemaWrite};
 pub enum RecordType {
     Put = 1,
     Delete = 2,
+    BatchBegin = 3,
 }
 
 impl TryFrom<u8> for RecordType {
@@ -15,6 +16,7 @@ impl TryFrom<u8> for RecordType {
         match value {
             1 => Ok(RecordType::Put),
             2 => Ok(RecordType::Delete),
+            3 => Ok(RecordType::BatchBegin),
             other => Err(DbError::Corruption(format!(
                 "Unknown record type byte: {}",
                 other
@@ -56,9 +58,94 @@ impl Record {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchOp {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteBatch {
+    ops: Vec<BatchOp>,
+}
+
+impl WriteBatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            ops: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> &mut Self {
+        self.ops.push(BatchOp::Put {
+            key: key.into(),
+            value: value.into(),
+        });
+        self
+    }
+
+    pub fn delete(&mut self, key: impl Into<Vec<u8>>) -> &mut Self {
+        self.ops.push(BatchOp::Delete { key: key.into() });
+        self
+    }
+
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    pub fn ops(&self) -> &[BatchOp] {
+        &self.ops
+    }
+
+    pub(crate) fn into_ops(self) -> Vec<BatchOp> {
+        self.ops
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_write_batch_builder() {
+        let mut batch = WriteBatch::new();
+        assert!(batch.is_empty());
+
+        batch
+            .put("a", "1")
+            .put(b"b".to_vec(), b"2".to_vec())
+            .delete("c");
+
+        assert_eq!(batch.len(), 3);
+        assert_eq!(
+            batch.ops(),
+            &[
+                BatchOp::Put {
+                    key: b"a".to_vec(),
+                    value: b"1".to_vec()
+                },
+                BatchOp::Put {
+                    key: b"b".to_vec(),
+                    value: b"2".to_vec()
+                },
+                BatchOp::Delete { key: b"c".to_vec() },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_batch_begin_record_type() {
+        assert_eq!(RecordType::try_from(3).unwrap(), RecordType::BatchBegin);
+        assert!(RecordType::try_from(4).is_err());
+    }
 
     #[test]
     fn test_record_serialization() {

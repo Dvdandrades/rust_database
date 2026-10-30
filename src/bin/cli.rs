@@ -1,4 +1,4 @@
-use rust_database::DbStore;
+use rust_database::{DbStore, WriteBatch};
 use std::env;
 use std::process;
 
@@ -7,6 +7,34 @@ fn print_usage() {
     println!("  cargo run --bin cli put <key> <value>");
     println!("  cargo run --bin cli get <key>");
     println!("  cargo run --bin cli delete <key>");
+    println!("  cargo run --bin cli batch (put <key> <value> | delete <key>)...");
+    println!("    e.g. cargo run --bin cli batch put a 1 put b 2 delete c");
+}
+
+fn parse_batch(args: &[String]) -> Result<WriteBatch, String> {
+    let mut batch = WriteBatch::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "put" => {
+                if i + 2 >= args.len() {
+                    return Err("'put' needs a key and a value".to_string());
+                }
+                batch.put(args[i + 1].as_bytes(), args[i + 2].as_bytes());
+                i += 3;
+            }
+            "delete" => {
+                if i + 1 >= args.len() {
+                    return Err("'delete' needs a key".to_string());
+                }
+                batch.delete(args[i + 1].as_bytes());
+                i += 2;
+            }
+            other => return Err(format!("Unknown batch operation: {}", other)),
+        }
+    }
+    Ok(batch)
 }
 
 fn main() {
@@ -66,6 +94,25 @@ fn main() {
                 Ok(_) => println!("OK"),
                 Err(e) => {
                     eprintln!("Error deleting: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        "batch" => {
+            let batch = match parse_batch(&args[2..]) {
+                Ok(b) => b,
+                Err(msg) => {
+                    eprintln!("Error: {}", msg);
+                    print_usage();
+                    process::exit(1);
+                }
+            };
+            let count = batch.len();
+
+            match store.write_batch(batch) {
+                Ok(_) => println!("OK {} operations", count),
+                Err(e) => {
+                    eprintln!("Error writing batch: {}", e);
                     process::exit(1);
                 }
             }
