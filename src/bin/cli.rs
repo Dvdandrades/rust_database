@@ -1,4 +1,4 @@
-use rust_database::{DbStore, WriteBatch};
+use rust_database::{DbStore, Scan, WriteBatch};
 use std::env;
 use std::process;
 
@@ -9,6 +9,29 @@ fn print_usage() {
     println!("  cargo run --bin cli delete <key>");
     println!("  cargo run --bin cli batch (put <key> <value> | delete <key>)...");
     println!("    e.g. cargo run --bin cli batch put a 1 put b 2 delete c");
+    println!("  cargo run --bin cli scan <prefix>        (use \"\" for every key)");
+    println!("  cargo run --bin cli range <start> <end>  (start inclusive, end exclusive)");
+}
+
+fn print_scan(scan: Scan<'_>) {
+    let mut count = 0usize;
+    for item in scan {
+        match item {
+            Ok((key, value)) => {
+                println!(
+                    "{}\t{}",
+                    String::from_utf8_lossy(&key),
+                    String::from_utf8_lossy(&value)
+                );
+                count += 1;
+            }
+            Err(e) => {
+                eprintln!("Error reading entry: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+    eprintln!("{} entries", count);
 }
 
 fn parse_batch(args: &[String]) -> Result<WriteBatch, String> {
@@ -116,6 +139,14 @@ fn main() {
                     process::exit(1);
                 }
             }
+        }
+        "scan" => print_scan(store.scan_prefix(args[2].as_bytes())),
+        "range" => {
+            if args.len() < 4 {
+                eprintln!("Incorrect use. Example: cargo run --bin cli range a m");
+                process::exit(1);
+            }
+            print_scan(store.scan_range(args[2].as_str()..args[3].as_str()));
         }
         _ => {
             eprintln!("Unknown command: {}", command);

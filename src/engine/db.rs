@@ -1,3 +1,4 @@
+use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -66,7 +67,10 @@ impl DbStore {
 
     pub fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
         let entry = self.index.get(key).ok_or(DbError::KeyNotFound)?;
+        self.read_value(entry)
+    }
 
+    fn read_value(&self, entry: KeyDirEntry) -> Result<Vec<u8>> {
         let log = self.log.lock().unwrap();
         let record = log.read_at(entry.file_id, entry.offset)?;
         drop(log);
@@ -80,6 +84,28 @@ impl DbStore {
                 "Index entry points to a batch header".to_string(),
             )),
         }
+    }
+
+    pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>) -> Scan<'_> {
+        Scan::new(self, self.index.scan_prefix(prefix.as_ref()))
+    }
+
+    pub fn scan_range<K, R>(&self, range: R) -> Scan<'_>
+    where
+        K: AsRef<[u8]>,
+        R: RangeBounds<K>,
+    {
+        let start = range.start_bound().map(|k| AsRef::<[u8]>::as_ref(k));
+        let end = range.end_bound().map(|k| AsRef::<[u8]>::as_ref(k));
+        Scan::new(self, self.index.range(start, end))
+    }
+
+    pub fn keys_with_prefix(&self, prefix: impl AsRef<[u8]>) -> Vec<Vec<u8>> {
+        self.index
+            .scan_prefix(prefix.as_ref())
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
     }
 
     pub fn delete(&self, key: Vec<u8>) -> Result<()> {
@@ -181,9 +207,51 @@ impl DbStore {
     }
 }
 
+pub struct Scan<'a> {
+    db: &'a DbStore,
+    entries: std::vec::IntoIter<(Vec<u8>, KeyDirEntry)>,
+}
+
+impl<'a> Scan<'a> {
+    fn new(db: &'a DbStore, entries: Vec<(Vec<u8>, KeyDirEntry)>) -> Self {
+        Self {
+            db,
+            entries: entries.into_iter(),
+        }
+    }
+
+    fn load(&self, key: Vec<u8>, entry: KeyDirEntry) -> Result<(Vec<u8>, Vec<u8>)> {
+        let value = self.db.read_value(entry)?;
+        Ok((key, value))
+    }
+}
+
+impl Iterator for Scan<'_> {
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (key, entry) = self.entries.next()?;
+        Some(self.load(key, entry))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.entries.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for Scan<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let (key, entry) = self.entries.next_back()?;
+        Some(self.load(key, entry))
+    }
+}
+
+impl ExactSizeIterator for Scan<'_> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Bound;
     use std::sync::Arc;
     use std::thread;
     use tempfile::tempdir;
@@ -509,6 +577,170 @@ mod tests {
 
         assert_eq!(db.get(b"b")?, b"2".to_vec());
         assert!(matches!(db.get(b"a"), Err(DbError::KeyNotFound)));
+        Ok(())
+    }
+
+    fn collect(scan: Scan<'_>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        scan.collect()
+    }
+
+    fn kv(k: &str, v: &str) -> (Vec<u8>, Vec<u8>) {
+        (k.as_bytes().to_vec(), v.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn test_scan_prefix_is_sorted_and_filtered() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = DbStore::open(dir.path())?;
+
+        db.put(b"user:3".to_vec(), b"david".to_vec())?;
+        db.put(b"order:1".to_vec(), b"x".to_vec())?;
+        db.put(b"user:1".to_vec(), b"ana".to_vec())?;
+        db.put(b"user:2".to_vec(), b"pablo".to_vec())?;
+        db.put(b"users".to_vec(), b"not a match for 'user:'".to_vec())?;
+        db.put(b"user:2".to_vec(), b"paco".to_vec())?;
+        db.put(b"user:9".to_vec(), b"juan".to_vec())?;
+        db.delete(b"user:9".to_vec())?;
+
+        assert_eq!(
+            collect(db.scan_prefix("user:"))?,
+            vec![
+                kv("user:1", "ana"),
+                kv("user:2", "paco"),
+                kv("user:3", "david")
+            ]
+        );
+        assert_eq!(db.scan_prefix("nope").count(), 0);
+        assert_eq!(db.scan_prefix("").count(), 5, "empty prefix = everything");
+        assert_eq!(db.scan_prefix(b"user:").len(), 3, "ExactSizeIterator");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_range_variants() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = DbStore::open(dir.path())?;
+        for k in ["a", "b", "c", "d", "e"] {
+            db.put(k.as_bytes().to_vec(), k.to_uppercase().into_bytes())?;
+        }
+        let keys = |scan: Scan<'_>| -> Vec<String> {
+            scan.map(|r| String::from_utf8(r.unwrap().0).unwrap())
+                .collect()
+        };
+
+        assert_eq!(keys(db.scan_range("b".."d")), ["b", "c"]);
+        assert_eq!(keys(db.scan_range("b"..="d")), ["b", "c", "d"]);
+        assert_eq!(keys(db.scan_range("d"..)), ["d", "e"]);
+        assert_eq!(keys(db.scan_range(.."c")), ["a", "b"]);
+        assert_eq!(
+            keys(db.scan_range::<&str, _>(..)),
+            ["a", "b", "c", "d", "e"]
+        );
+        assert_eq!(
+            keys(db.scan_range::<&str, _>((Bound::Excluded("b"), Bound::Unbounded))),
+            ["c", "d", "e"]
+        );
+        assert_eq!(
+            keys(db.scan_range(b"b".to_vec()..b"d".to_vec())),
+            ["b", "c"],
+            "owned bytes keys work too"
+        );
+        assert_eq!(
+            db.scan_range("z".."a").count(),
+            0,
+            "inverted: empty, no panic"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_can_run_in_reverse() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = DbStore::open(dir.path())?;
+        db.put(b"k1".to_vec(), b"1".to_vec())?;
+        db.put(b"k2".to_vec(), b"2".to_vec())?;
+        db.put(b"k3".to_vec(), b"3".to_vec())?;
+
+        let forward = collect(db.scan_prefix("k"))?;
+        let mut backward = collect_rev(db.scan_prefix("k"))?;
+        backward.reverse();
+        assert_eq!(forward, backward);
+        assert_eq!(
+            db.scan_prefix("k").next_back().unwrap()?,
+            kv("k3", "3"),
+            "last key first when walking backwards"
+        );
+
+        Ok(())
+    }
+
+    fn collect_rev(scan: Scan<'_>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        scan.rev().collect()
+    }
+
+    #[test]
+    fn test_scan_is_a_snapshot() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = DbStore::open(dir.path())?;
+        db.put(b"k1".to_vec(), b"old1".to_vec())?;
+        db.put(b"k2".to_vec(), b"old2".to_vec())?;
+
+        let scan = db.scan_prefix("k");
+
+        db.put(b"k1".to_vec(), b"new1".to_vec())?;
+        db.delete(b"k2".to_vec())?;
+        db.put(b"k3".to_vec(), b"late".to_vec())?;
+
+        assert_eq!(collect(scan)?, vec![kv("k1", "old1"), kv("k2", "old2")]);
+        assert_eq!(
+            collect(db.scan_prefix("k"))?,
+            vec![kv("k1", "new1"), kv("k3", "late")]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_after_reopen_and_with_batches() -> Result<()> {
+        let dir = tempdir().unwrap();
+
+        {
+            let db = DbStore::open(dir.path())?;
+            db.put(b"p:a".to_vec(), b"1".to_vec())?;
+            let mut batch = WriteBatch::new();
+            batch
+                .put("p:b", "2")
+                .put("p:c", "3")
+                .put("q:x", "9")
+                .delete("p:a");
+            db.write_batch(batch)?;
+        }
+
+        let db = DbStore::open(dir.path())?;
+        assert_eq!(
+            collect(db.scan_prefix("p:"))?,
+            vec![kv("p:b", "2"), kv("p:c", "3")]
+        );
+        assert_eq!(collect(db.scan_prefix("q:"))?, vec![kv("q:x", "9")]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_does_not_block_writers() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = DbStore::open(dir.path())?;
+        for i in 0..50 {
+            db.put(format!("k{i:02}").into_bytes(), vec![b'v'])?;
+        }
+
+        let mut scan = db.scan_prefix("k");
+        scan.next().unwrap()?;
+        db.put(b"k99".to_vec(), b"w".to_vec())?;
+        assert_eq!(scan.count(), 49);
+
         Ok(())
     }
 }

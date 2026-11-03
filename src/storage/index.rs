@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::RwLock;
 
 #[derive(Debug, Clone, Copy)]
@@ -14,14 +15,34 @@ pub enum IndexUpdate {
     Remove { key: Vec<u8> },
 }
 
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < u8::MAX {
+            end.push(last + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
+fn is_inverted(start: Bound<&[u8]>, end: Bound<&[u8]>) -> bool {
+    match (start, end) {
+        (Bound::Included(s) | Bound::Excluded(s), Bound::Included(e) | Bound::Excluded(e)) => {
+            s > e || (s == e && matches!((start, end), (Bound::Excluded(_), Bound::Excluded(_))))
+        }
+        _ => false,
+    }
+}
+
 pub struct KeyIndex {
-    index: RwLock<HashMap<Vec<u8>, KeyDirEntry>>,
+    index: RwLock<BTreeMap<Vec<u8>, KeyDirEntry>>,
 }
 
 impl KeyIndex {
     pub fn new() -> Self {
         Self {
-            index: RwLock::new(HashMap::new()),
+            index: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -72,6 +93,24 @@ impl KeyIndex {
     pub fn get_all(&self) -> Vec<(Vec<u8>, KeyDirEntry)> {
         let guard = self.index.read().unwrap();
         guard.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
+    pub fn range(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Vec<(Vec<u8>, KeyDirEntry)> {
+        if is_inverted(start, end) {
+            return Vec::new();
+        }
+        let guard = self.index.read().unwrap();
+        guard
+            .range::<[u8], _>((start, end))
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, KeyDirEntry)> {
+        match prefix_successor(prefix) {
+            Some(end) => self.range(Bound::Included(prefix), Bound::Excluded(end.as_slice())),
+            None => self.range(Bound::Included(prefix), Bound::Unbounded),
+        }
     }
 }
 
@@ -181,5 +220,49 @@ mod tests {
         );
         assert!(index.get(b"gone").is_none());
         assert_eq!(index.get(b"old").unwrap().offset, 0);
+    }
+
+    fn put(index: &KeyIndex, key: &[u8]) {
+        index.insert(key.to_vec(), 1, 0, 1);
+    }
+
+    fn keys(entries: Vec<(Vec<u8>, KeyDirEntry)>) -> Vec<Vec<u8>> {
+        entries.into_iter().map(|(k, _)| k).collect()
+    }
+
+    #[test]
+    fn test_get_all_is_sorted() {
+        let index = KeyIndex::new();
+        for k in ["m", "a", "z", "b"] {
+            put(&index, k.as_bytes());
+        }
+        assert_eq!(
+            keys(index.get_all()),
+            vec![b"a".to_vec(), b"b".to_vec(), b"m".to_vec(), b"z".to_vec()]
+        );
+    }
+
+    #[test]
+    fn test_scan_prefix() {
+        let index = KeyIndex::new();
+        for k in ["user:2", "user:1", "user", "users", "usf", "usd", "other"] {
+            put(&index, k.as_bytes());
+        }
+
+        assert_eq!(
+            keys(index.scan_prefix(b"user:")),
+            vec![b"user:1".to_vec(), b"user:2".to_vec()]
+        );
+        assert_eq!(
+            keys(index.scan_prefix(b"user")),
+            vec![
+                b"user".to_vec(),
+                b"user:1".to_vec(),
+                b"user:2".to_vec(),
+                b"users".to_vec()
+            ]
+        );
+        assert!(index.scan_prefix(b"nothing").is_empty());
+        assert_eq!(index.scan_prefix(b"").len(), 7, "empty prefix = everything");
     }
 }
