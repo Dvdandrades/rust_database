@@ -202,6 +202,7 @@ pub struct LogManager {
     active_file_id: u32,
     active_file: File,
     active_file_size: u64,
+    total_size: u64,
     read_only_files: BTreeMap<u32, PathBuf>,
 }
 
@@ -241,12 +242,18 @@ impl LogManager {
 
         segments.remove(&active_file_id);
 
+        let mut total_size = active_file_size;
+        for path in segments.values() {
+            total_size += fs::metadata(path)?.len();
+        }
+
         Ok(Self {
             dir_path,
             max_file_size,
             active_file_id,
             active_file: file,
             active_file_size,
+            total_size,
             read_only_files: segments,
         })
     }
@@ -263,6 +270,7 @@ impl LogManager {
         }
 
         self.active_file_size += buf.len() as u64;
+        self.total_size += buf.len() as u64;
         Ok(())
     }
 
@@ -438,6 +446,10 @@ impl LogManager {
 
     pub fn active_file_id(&self) -> u32 {
         self.active_file_id
+    }
+
+    pub fn total_size(&self) -> u64 {
+        self.total_size
     }
 }
 

@@ -2,6 +2,7 @@ use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::engine::metrics::{Metrics, MetricsSnapshot};
 use crate::error::{DbError, Result};
 use crate::model::record::{BatchOp, Record, RecordType, WriteBatch};
 use crate::storage::index::{IndexUpdate, KeyDirEntry, KeyIndex};
@@ -12,6 +13,7 @@ pub struct DbStore {
     log: Mutex<LogManager>,
     index: KeyIndex,
     max_file_size: u64,
+    metrics: Metrics,
 }
 
 impl DbStore {
@@ -44,11 +46,15 @@ impl DbStore {
             }
         }
 
+        let metrics = Metrics::default();
+        metrics.set_disk_size(log.total_size());
+
         Ok(Self {
             path: path_ref,
             log: Mutex::new(log),
             index,
             max_file_size,
+            metrics,
         })
     }
 
@@ -59,15 +65,28 @@ impl DbStore {
 
         let mut log = self.log.lock().unwrap();
         let (file_id, pos) = log.append(&record)?;
+        self.metrics.set_disk_size(log.total_size());
         drop(log);
 
         self.index.insert(key, file_id, pos, size);
+        self.metrics.record_put();
         Ok(())
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
-        let entry = self.index.get(key).ok_or(DbError::KeyNotFound)?;
-        self.read_value(entry)
+        self.metrics.record_read();
+
+        let result = match self.index.get(key) {
+            Some(entry) => self.read_value(entry),
+            None => Err(DbError::KeyNotFound),
+        };
+
+        match &result {
+            Ok(_) => self.metrics.record_get_hit(),
+            Err(DbError::KeyNotFound) => self.metrics.record_get_miss(),
+            Err(_) => {}
+        }
+        result
     }
 
     fn read_value(&self, entry: KeyDirEntry) -> Result<Vec<u8>> {
@@ -87,6 +106,7 @@ impl DbStore {
     }
 
     pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>) -> Scan<'_> {
+        self.metrics.record_scan();
         Scan::new(self, self.index.scan_prefix(prefix.as_ref()))
     }
 
@@ -95,6 +115,7 @@ impl DbStore {
         K: AsRef<[u8]>,
         R: RangeBounds<K>,
     {
+        self.metrics.record_scan();
         let start = range.start_bound().map(|k| AsRef::<[u8]>::as_ref(k));
         let end = range.end_bound().map(|k| AsRef::<[u8]>::as_ref(k));
         Scan::new(self, self.index.range(start, end))
@@ -108,6 +129,10 @@ impl DbStore {
             .collect()
     }
 
+    pub fn metrics(&self) -> MetricsSnapshot {
+        self.metrics.snapshot(self.index.len() as u64)
+    }
+
     pub fn delete(&self, key: Vec<u8>) -> Result<()> {
         if self.index.get(&key).is_none() {
             return Err(DbError::KeyNotFound);
@@ -116,9 +141,11 @@ impl DbStore {
         let record = Record::new_delete(key.clone());
         let mut log = self.log.lock().unwrap();
         log.append(&record)?;
+        self.metrics.set_disk_size(log.total_size());
         drop(log);
 
         self.index.remove(&key);
+        self.metrics.record_delete();
         Ok(())
     }
 
@@ -126,6 +153,7 @@ impl DbStore {
         if batch.is_empty() {
             return Ok(());
         }
+        let ops_count = batch.len() as u64;
 
         let mut records = Vec::with_capacity(batch.len());
         let mut targets = Vec::with_capacity(batch.len());
@@ -144,6 +172,7 @@ impl DbStore {
 
         let mut log = self.log.lock().unwrap();
         let locations = log.append_batch(&records)?;
+        self.metrics.set_disk_size(log.total_size());
 
         let updates = targets
             .into_iter()
@@ -165,6 +194,7 @@ impl DbStore {
         self.index.apply_batch(updates);
         drop(log);
 
+        self.metrics.record_batch(ops_count);
         Ok(())
     }
 
@@ -197,12 +227,14 @@ impl DbStore {
 
         let mut log_guard = self.log.lock().unwrap();
         *log_guard = LogManager::open(&compacted_dir, self.max_file_size)?;
+        self.metrics.set_disk_size(log_guard.total_size());
         drop(log_guard);
 
         for (key, file_id, pos, size) in new_index_map {
             self.index.insert(key, file_id, pos, size);
         }
 
+        self.metrics.record_compaction();
         Ok(())
     }
 }
@@ -740,6 +772,113 @@ mod tests {
         scan.next().unwrap()?;
         db.put(b"k99".to_vec(), b"w".to_vec())?;
         assert_eq!(scan.count(), 49);
+
+        Ok(())
+    }
+
+    fn dir_size(path: &Path) -> u64 {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum()
+    }
+
+    #[test]
+    fn test_metrics_start_at_zero() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = DbStore::open(dir.path())?;
+
+        assert_eq!(db.metrics(), MetricsSnapshot::default());
+        Ok(())
+    }
+
+    #[test]
+    fn test_metrics_count_operations() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = DbStore::open(dir.path())?;
+
+        db.put(b"a".to_vec(), b"1".to_vec())?;
+        db.put(b"b".to_vec(), b"2".to_vec())?;
+
+        assert_eq!(db.get(b"a")?, b"1".to_vec());
+        assert!(db.get(b"zzz").is_err());
+
+        db.delete(b"a".to_vec())?;
+        assert!(db.delete(b"nope".to_vec()).is_err());
+
+        let mut batch = WriteBatch::new();
+        batch.put("c", "3").put("d", "4").delete("b");
+        db.write_batch(batch)?;
+        db.write_batch(WriteBatch::new())?;
+
+        assert_eq!(db.scan_prefix("c").count(), 1);
+
+        let m = db.metrics();
+        assert_eq!(m.reads, 2);
+        assert_eq!(m.get_hits, 1);
+        assert_eq!(m.get_misses, 1);
+        assert_eq!(m.puts, 2);
+        assert_eq!(m.deletes, 1, "deleting a missing key is not counted");
+        assert_eq!(m.batches, 1, "empty batches are not counted");
+        assert_eq!(m.batch_ops, 3);
+        assert_eq!(m.scans, 1);
+        assert_eq!(m.compactions, 0);
+        assert_eq!(m.live_keys, 2);
+        assert_eq!(m.total_writes(), 6);
+        assert_eq!(m.get_hit_ratio(), Some(0.5));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_metrics_disk_size_tracks_the_log() -> Result<()> {
+        let dir = tempdir().unwrap();
+
+        {
+            let db = DbStore::open(dir.path())?;
+            assert_eq!(db.metrics().disk_size_bytes, 0);
+
+            db.put(b"k1".to_vec(), vec![7; 100])?;
+            let after_put = db.metrics().disk_size_bytes;
+            assert!(after_put > 100);
+            assert_eq!(after_put, dir_size(dir.path()));
+
+            db.delete(b"k1".to_vec())?;
+            let after_delete = db.metrics().disk_size_bytes;
+            assert!(after_delete > after_put, "a tombstone is appended");
+
+            let mut batch = WriteBatch::new();
+            batch.put("k2", "v").put("k3", "v");
+            db.write_batch(batch)?;
+            assert!(db.metrics().disk_size_bytes > after_delete);
+            assert_eq!(db.metrics().disk_size_bytes, dir_size(dir.path()));
+        }
+
+        let db = DbStore::open(dir.path())?;
+        let m = db.metrics();
+        assert_eq!(m.disk_size_bytes, dir_size(dir.path()));
+        assert_eq!(m.live_keys, 2, "gauges survive a restart");
+        assert_eq!(m.puts, 0, "counters restart from zero");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_metric_after_compaction() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = DbStore::open(dir.path())?;
+
+        for i in 0..20 {
+            db.put(b"hot".to_vec(), format!("value_{i}").into_bytes())?;
+        }
+        let before = db.metrics().disk_size_bytes;
+
+        db.compact()?;
+
+        let m = db.metrics();
+        assert_eq!(m.compactions, 1);
+        assert_eq!(m.live_keys, 1);
+        assert!(m.disk_size_bytes < before, "stale versions are dropped");
 
         Ok(())
     }

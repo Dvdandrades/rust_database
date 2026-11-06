@@ -90,6 +90,14 @@ impl KeyIndex {
         guard.clear();
     }
 
+    pub fn len(&self) -> usize {
+        self.index.read().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.read().unwrap().is_empty()
+    }
+
     pub fn get_all(&self) -> Vec<(Vec<u8>, KeyDirEntry)> {
         let guard = self.index.read().unwrap();
         guard.iter().map(|(k, v)| (k.clone(), *v)).collect()
@@ -182,6 +190,22 @@ mod tests {
 
         assert!(index.get(b"key1").is_none());
         assert!(index.get(b"key2").is_none());
+    }
+
+    #[test]
+    fn test_len_and_is_empty() {
+        let index = KeyIndex::new();
+        assert!(index.is_empty());
+        assert_eq!(index.len(), 0);
+
+        index.insert(b"a".to_vec(), 1, 0, 1);
+        index.insert(b"b".to_vec(), 1, 1, 1);
+        index.insert(b"a".to_vec(), 1, 2, 1);
+        assert_eq!(index.len(), 2, "overwritting a key must not grow the index");
+        assert!(!index.is_empty());
+
+        index.remove(b"a");
+        assert_eq!(index.len(), 1);
     }
 
     #[test]
