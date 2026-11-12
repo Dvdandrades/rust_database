@@ -3,6 +3,11 @@ name = "rust_database"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [
+    "rust_database_tests"
+]
+
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"

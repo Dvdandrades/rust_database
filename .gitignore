@@ -1,2 +1,3 @@
 /target
 data.db
+rust_database_tests/fuzz/target

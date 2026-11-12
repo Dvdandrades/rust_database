@@ -1,0 +1,11 @@
+[package]
+name = "rust_database_tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rust_database = { path = ".." }
+
+[dev-dependencies]
+tempfile = "3"

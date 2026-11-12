@@ -258,11 +258,11 @@ impl LogManager {
         })
     }
 
-    fn write_and_sync(&mut self, buf: &[u8]) -> Result<()> {
-        let result = self
-            .active_file
-            .write_all(buf)
-            .and_then(|_| self.active_file.sync_all());
+    fn write_buf(&mut self, buf: &[u8], sync: bool) -> Result<()> {
+        let mut result = self.active_file.write_all(buf);
+        if result.is_ok() && sync {
+            result = self.active_file.sync_all();
+        }
 
         if let Err(e) = result {
             let _ = self.active_file.set_len(self.active_file_size);
@@ -272,6 +272,10 @@ impl LogManager {
         self.active_file_size += buf.len() as u64;
         self.total_size += buf.len() as u64;
         Ok(())
+    }
+
+    fn write_and_sync(&mut self, buf: &[u8]) -> Result<()> {
+        self.write_buf(buf, true)
     }
 
     pub fn append(&mut self, record: &Record) -> Result<(u32, u64)> {
@@ -364,6 +368,81 @@ impl LogManager {
         self.active_file = file;
         self.active_file_size = 0;
 
+        Ok(())
+    }
+
+    pub fn rewrite_live(&mut self, live: &[(u32, u64)]) -> Result<(Vec<RecordLocation>, Vec<u32>)> {
+        let obsolete: Vec<u32> = self
+            .read_only_files
+            .keys()
+            .copied()
+            .chain(std::iter::once(self.active_file_id))
+            .collect();
+
+        self.rotate()?;
+
+        let mut locations = Vec::with_capacity(live.len());
+        let mut frame = Vec::new();
+        for &(file_id, offset) in live {
+            let record = self.read_at(file_id, offset)?;
+            if record.recid != RecordType::Put as u8 {
+                return Err(DbError::Corruption(
+                    "Index entry points to a non-put record during compaction".to_string(),
+                ));
+            }
+
+            frame.clear();
+            let frame_len = enconde_frame(&record.serialize()?, &mut frame)?;
+            let size = u32::try_from(frame_len).map_err(|_| {
+                DbError::Serialization("record is too large for a log frame".to_string())
+            })?;
+
+            if self.active_file_size > 0
+                && self.active_file_size + frame.len() as u64 > self.max_file_size
+            {
+                self.rotate()?;
+            }
+
+            let offset = self.active_file_size;
+            self.write_buf(&frame, false)?;
+            locations.push(RecordLocation {
+                file_id: self.active_file_id,
+                offset,
+                size,
+            });
+        }
+
+        self.active_file.sync_all()?;
+        self.sync_dir()?;
+        Ok((locations, obsolete))
+    }
+
+    pub fn remove_segments(&mut self, ids: &[u32]) -> Result<()> {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        for id in ids {
+            if id == self.active_file_id {
+                continue;
+            }
+            let Some(path) = self.read_only_files.get(&id) else {
+                continue;
+            };
+            let len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            self.read_only_files.remove(&id);
+            self.total_size = self.total_size.saturating_sub(len);
+        }
+        self.sync_dir()
+    }
+
+    fn sync_dir(&self) -> Result<()> {
+        if cfg!(unix) {
+            File::open(&self.dir_path)?.sync_all()?;
+        }
         Ok(())
     }
 

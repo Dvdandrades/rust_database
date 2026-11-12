@@ -6,4 +6,4 @@ pub mod storage;
 pub use engine::db::{DbStore, Scan};
 pub use engine::metrics::MetricsSnapshot;
 pub use error::{DbError, Result};
-pub use model::record::{BatchOp, WriteBatch};
+pub use model::record::{BatchOp, Record, WriteBatch};

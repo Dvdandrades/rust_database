@@ -1,6 +1,7 @@
 use std::ops::RangeBounds;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::engine::metrics::{Metrics, MetricsSnapshot};
 use crate::error::{DbError, Result};
@@ -9,11 +10,10 @@ use crate::storage::index::{IndexUpdate, KeyDirEntry, KeyIndex};
 use crate::storage::log::LogManager;
 
 pub struct DbStore {
-    path: PathBuf,
     log: Mutex<LogManager>,
     index: KeyIndex,
-    max_file_size: u64,
     metrics: Metrics,
+    generation: AtomicU64,
 }
 
 impl DbStore {
@@ -50,11 +50,10 @@ impl DbStore {
         metrics.set_disk_size(log.total_size());
 
         Ok(Self {
-            path: path_ref,
             log: Mutex::new(log),
             index,
-            max_file_size,
             metrics,
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -65,10 +64,9 @@ impl DbStore {
 
         let mut log = self.log.lock().unwrap();
         let (file_id, pos) = log.append(&record)?;
+        self.index.insert(key, file_id, pos, size);
         self.metrics.set_disk_size(log.total_size());
         drop(log);
-
-        self.index.insert(key, file_id, pos, size);
         self.metrics.record_put();
         Ok(())
     }
@@ -76,9 +74,12 @@ impl DbStore {
     pub fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
         self.metrics.record_read();
 
-        let result = match self.index.get(key) {
-            Some(entry) => self.read_value(entry),
-            None => Err(DbError::KeyNotFound),
+        let result = {
+            let log = self.log.lock().unwrap();
+            match self.index.get(key) {
+                Some(entry) => Self::value_at(&log, entry),
+                None => Err(DbError::KeyNotFound),
+            }
         };
 
         match &result {
@@ -89,10 +90,8 @@ impl DbStore {
         result
     }
 
-    fn read_value(&self, entry: KeyDirEntry) -> Result<Vec<u8>> {
-        let log = self.log.lock().unwrap();
+    fn value_at(log: &LogManager, entry: KeyDirEntry) -> Result<Vec<u8>> {
         let record = log.read_at(entry.file_id, entry.offset)?;
-        drop(log);
 
         let rec_type = RecordType::try_from(record.recid)?;
 
@@ -105,9 +104,21 @@ impl DbStore {
         }
     }
 
+    fn read_scanned(&self, key: &[u8], entry: KeyDirEntry, generation: u64) -> Result<Vec<u8>> {
+        let log = self.log.lock().unwrap();
+        if self.generation.load(Ordering::Acquire) == generation {
+            return Self::value_at(&log, entry);
+        }
+        match self.index.get(key) {
+            Some(current) => Self::value_at(&log, current),
+            None => Err(DbError::KeyNotFound),
+        }
+    }
+
     pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>) -> Scan<'_> {
         self.metrics.record_scan();
-        Scan::new(self, self.index.scan_prefix(prefix.as_ref()))
+        let generation = self.generation.load(Ordering::Acquire);
+        Scan::new(self, generation, self.index.scan_prefix(prefix.as_ref()))
     }
 
     pub fn scan_range<K, R>(&self, range: R) -> Scan<'_>
@@ -118,7 +129,8 @@ impl DbStore {
         self.metrics.record_scan();
         let start = range.start_bound().map(|k| AsRef::<[u8]>::as_ref(k));
         let end = range.end_bound().map(|k| AsRef::<[u8]>::as_ref(k));
-        Scan::new(self, self.index.range(start, end))
+        let generation = self.generation.load(Ordering::Acquire);
+        Scan::new(self, generation, self.index.range(start, end))
     }
 
     pub fn keys_with_prefix(&self, prefix: impl AsRef<[u8]>) -> Vec<Vec<u8>> {
@@ -134,17 +146,17 @@ impl DbStore {
     }
 
     pub fn delete(&self, key: Vec<u8>) -> Result<()> {
+        let mut log = self.log.lock().unwrap();
         if self.index.get(&key).is_none() {
             return Err(DbError::KeyNotFound);
         }
 
         let record = Record::new_delete(key.clone());
-        let mut log = self.log.lock().unwrap();
         log.append(&record)?;
+        self.index.remove(&key);
         self.metrics.set_disk_size(log.total_size());
         drop(log);
 
-        self.index.remove(&key);
         self.metrics.record_delete();
         Ok(())
     }
@@ -199,61 +211,56 @@ impl DbStore {
     }
 
     pub fn compact(&self) -> Result<()> {
-        let compacted_dir = self.path.join("compacted_temp");
-        if compacted_dir.exists() {
-            std::fs::remove_dir_all(&compacted_dir)?;
-        }
-
-        let mut new_log = LogManager::open(&compacted_dir, self.max_file_size)?;
+        let mut log = self.log.lock().unwrap();
 
         let snapshot = self.index.get_all();
-        let mut new_index_map = Vec::new();
+        let live: Vec<(u32, u64)> = snapshot
+            .iter()
+            .map(|(_, entry)| (entry.file_id, entry.offset))
+            .collect();
 
-        let log_guard = self.log.lock().unwrap();
-        for (key, entry) in snapshot {
-            let record = log_guard.read_at(entry.file_id, entry.offset)?;
-            let serialized = record.serialize()?;
-            let size = (8 + serialized.len()) as u32;
+        let (locations, obsolete) = log.rewrite_live(&live)?;
 
-            let (new_file_id, new_pos) = new_log.append(&record)?;
-            new_index_map.push((key, new_file_id, new_pos, size));
-        }
-        drop(log_guard);
+        let updates = snapshot
+            .into_iter()
+            .zip(locations)
+            .map(|((key, _), loc)| IndexUpdate::Put {
+                key,
+                entry: KeyDirEntry {
+                    file_id: loc.file_id,
+                    offset: loc.offset,
+                    size: loc.size,
+                },
+            });
+        self.index.apply_batch(updates);
+        self.generation.fetch_add(1, Ordering::Release);
 
-        let _ = {
-            let log_guard = self.log.lock().unwrap();
-            log_guard.active_file_id()
-        };
-
-        let mut log_guard = self.log.lock().unwrap();
-        *log_guard = LogManager::open(&compacted_dir, self.max_file_size)?;
-        self.metrics.set_disk_size(log_guard.total_size());
-        drop(log_guard);
-
-        for (key, file_id, pos, size) in new_index_map {
-            self.index.insert(key, file_id, pos, size);
-        }
+        let removed = log.remove_segments(&obsolete);
+        self.metrics.set_disk_size(log.total_size());
+        drop(log);
 
         self.metrics.record_compaction();
-        Ok(())
+        removed
     }
 }
 
 pub struct Scan<'a> {
     db: &'a DbStore,
+    generation: u64,
     entries: std::vec::IntoIter<(Vec<u8>, KeyDirEntry)>,
 }
 
 impl<'a> Scan<'a> {
-    fn new(db: &'a DbStore, entries: Vec<(Vec<u8>, KeyDirEntry)>) -> Self {
+    fn new(db: &'a DbStore, generation: u64, entries: Vec<(Vec<u8>, KeyDirEntry)>) -> Self {
         Self {
             db,
+            generation,
             entries: entries.into_iter(),
         }
     }
 
     fn load(&self, key: Vec<u8>, entry: KeyDirEntry) -> Result<(Vec<u8>, Vec<u8>)> {
-        let value = self.db.read_value(entry)?;
+        let value = self.db.read_scanned(&key, entry, self.generation)?;
         Ok((key, value))
     }
 }
@@ -863,6 +870,37 @@ mod tests {
         Ok(())
     }
 
+    fn segment_files(path: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(path)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".log"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_compact_replaces_segments_in_place() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = DbStore::open(dir.path())?;
+        for i in 0..20 {
+            db.put(b"hot".to_vec(), format!("value_{i}").into_bytes())?;
+        }
+        assert_eq!(segment_files(dir.path()), ["0000000000.log"]);
+
+        db.compact()?;
+
+        assert_eq!(
+            segment_files(dir.path()),
+            ["0000000001.log"],
+            "old segmente removed, compacted one lives next to where the old one was"
+        );
+        assert!(!dir.path().join("compacted_temp").exists());
+        assert_eq!(db.metrics().disk_size_bytes, dir_size(dir.path()));
+        Ok(())
+    }
+
     #[test]
     fn test_metric_after_compaction() -> Result<()> {
         let dir = tempdir().unwrap();
@@ -880,6 +918,59 @@ mod tests {
         assert_eq!(m.live_keys, 1);
         assert!(m.disk_size_bytes < before, "stale versions are dropped");
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_created_before_compaction_still_reads() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = DbStore::open(dir.path())?;
+        db.put(b"k1".to_vec(), b"a".to_vec())?;
+        db.put(b"k1".to_vec(), b"b".to_vec())?;
+        db.put(b"k2".to_vec(), b"c".to_vec())?;
+
+        let scan = db.scan_prefix("k");
+        db.compact()?;
+
+        assert_eq!(collect(scan)?, vec![kv("k1", "b"), kv("k2", "c")]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_crash_before_old_segments_are_removed_is_harmless() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let backup = tempdir().unwrap();
+
+        {
+            let db = DbStore::open(dir.path())?;
+            db.put(b"a".to_vec(), b"1".to_vec())?;
+            db.put(b"a".to_vec(), b"2".to_vec())?;
+            db.put(b"gone".to_vec(), b"x".to_vec())?;
+            db.delete(b"gone".to_vec())?;
+            for entry in std::fs::read_dir(dir.path()).unwrap() {
+                let entry = entry.unwrap();
+                std::fs::copy(entry.path(), backup.path().join(entry.file_name())).unwrap();
+            }
+            db.compact()?;
+        }
+
+        for entry in std::fs::read_dir(backup.path()).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), dir.path().join(entry.file_name())).unwrap();
+        }
+        assert_eq!(segment_files(dir.path()).len(), 2);
+
+        let db = DbStore::open(dir.path())?;
+        assert_eq!(db.get(b"a")?, b"2".to_vec());
+        assert!(matches!(db.get(b"gone"), Err(DbError::KeyNotFound)));
+
+        db.compact()?;
+        assert_eq!(
+            segment_files(dir.path()).len(),
+            1,
+            "leftovers are collected"
+        );
+        assert_eq!(db.get(b"a")?, b"2".to_vec());
         Ok(())
     }
 }

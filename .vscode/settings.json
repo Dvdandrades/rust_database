@@ -1,0 +1,6 @@
+{
+  "rust-analyzer.linkedProjects": [
+    "Cargo.toml",
+    "rust_database_tests/fuzz/Cargo.toml"
+  ]
+}

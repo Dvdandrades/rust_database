@@ -1,0 +1,32 @@
+[package]
+name = "rust_database-fuzz"
+version = "0.1.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+tempfile = "3"
+
+[dependencies.rust_database]
+path = "../.."
+
+[[bin]]
+name ="record_deserialize"
+path ="fuzz_targets/record_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_recovery"
+path = "fuzz_targets/log_recovery.rs"
+test = false
+doc = false
+bench = false
