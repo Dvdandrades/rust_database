@@ -1,19 +1,19 @@
 //! read-modify-write primitive: if two threads must update the same key
 //! based on its current value, coordinate them yourself.
 //! *Compaction is manual and blocks other operations while it runs.
-//! 
+//!
 //! ## Examples
-//! 
+//!
 //! The `examples/` directory shows how to embed the store in a Rust
 //! application. Run any of them with `cargo run --example <name>`:
-//! 
+//!
 //! * `basic`: open, put, get, delete, error handling and persistence.
 //! * `batch_and_scan`: atomic batches, prefix and range scans, reverse scans.
 //! * `metrics_and_compactions`: dead space, `compact`, counters and the
 //!   Prometheus output.
 //! * `embedded_app`: a complete miniature service (typed repository, secondary
 //!   index kept consistent with batches, worker threads, maintenance).
-//! 
+//!
 //! There is also a small command-line front end, `cargo run --bin cli`, which
 //! prints its usage when run without arguments.
 
