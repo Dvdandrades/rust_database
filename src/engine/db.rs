@@ -1,3 +1,11 @@
+//! The storage engine's public entry point.
+//! 
+//! This module contains [`DbStore`], the handle applicattions use to read and
+//! write data, and [`Scan`], the iterator returned by prefix and range scans.
+//! Everything else in the engine (the segmented log, the in-memory index, the
+//! metrics counters) is an implementation detail reachable only through
+//! `DbStore`.
+
 use std::ops::RangeBounds;
 use std::path::Path;
 use std::sync::Mutex;
@@ -9,6 +17,94 @@ use crate::model::record::{BatchOp, Record, RecordType, WriteBatch};
 use crate::storage::index::{IndexUpdate, KeyDirEntry, KeyIndex};
 use crate::storage::log::LogManager;
 
+/// An embedded, persistent, thread-sage key-value store.
+/// 
+/// `DbStore` is the main type of this crate. Keys and values are arbitrary byte
+/// strings. Every write is appended to a segmented, checksummed log on disk, and
+/// a sorted in-memory index maps each live key to the position of its latest
+/// value (a design inspired by [Bitcask]). Reads therefore cost one index lookup
+/// plus one positioned disk read.
+/// 
+/// [Bitcask]: https://riak.com/assets/bitcask-intro.pdf
+/// 
+/// # Quick start
+/// 
+/// ```
+/// use rust_database::{DbError, DbStore};
+/// # let dir = tempfile::tempdir()?;
+/// 
+/// let db = DbStore::open(dir.path())?;
+/// 
+/// db.put(b"greeting".to_vec(), b"hello".to_vec())?;
+/// assert_eq!(db.get(b"greeting")?, b"hello".to_vec());
+/// 
+/// db.delete(b"greeting".to_vec())?;
+/// assert!(matches!(db.get(b"greeting"), Err(DbError::KeyNotFound)));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+/// 
+/// # Guarantees
+/// 
+/// * **Durability.** [`put`](Self::put), [`delete`](Self::delete) and
+/// [`write_batch`](Self::write_batch) flush with `fsync` before returning, so
+/// an `Ok` means the operation has been handed to stable storage. There is no
+/// separate "flush" or "close" step: dropping the store loses nothing.
+/// * **Crash safety.** Every record is framed with its length and a CRC-32. After
+/// a crash, [`open`](Self::open) discards a torn write at the end of the newest
+/// segment and keeps everything before it.
+/// * **Atomic batches.** A [`WriteBatch`] is written as a single checksummed unit:
+/// after a crash either all of its operations are visible or none are. While
+/// the process is running, readers never observe half of a batch either.
+/// * **Ordered keys.** Keys are ordered by their bytes (lexicographically), which
+/// is what [`scan_prefix`](Self::scan_prefix) and
+/// [`scan_range`](Self::scan_range) rely on.
+/// 
+/// # Costs and limits
+/// 
+/// * **All live keys are held in memory** (plus a small fixed-size entry per
+/// key). Values stay on disk and are read on demand. Size your key space
+/// accordingly.
+/// * **Overwrites and deletes leave dead space.** Old versions stay in the log
+/// until you call [`compact`](Self::compact); nothing compacts automatically.
+/// * **Segments rotate at 256 MiB.** The directory holds one `NNNNNNNNNN.log`
+/// file per segment.
+/// * **One process per directory.** The directory is not protected by a lock
+/// file. Opening the same directory twice (from two `DbStore's` or two
+/// processes) at the same time is not supported and will corrupt the log.
+/// 
+/// # Concurrency
+/// 
+/// `DbStore` is `Send + Sync` and every method takes `&self`, so a single store
+/// can be shared between threads, typically behind an [`Arc`][std::sync::Arc]:
+/// 
+/// ```
+/// use std::{sync::Arc, thread};
+/// use rust_database::DbStore;
+/// # let dir = tempfile::tempdir()?;
+/// 
+/// let db = Arc::new(DbStore::open(dir.path())?);
+/// 
+/// let workers: Vec<_> = (0..4).map(|i| {
+///     let db = Arc::clone(&db);
+///     thread::spawn(move || {
+///         db.put(format!("worker:{i}").into_bytes(), b"done".to_vec()).unwrap();
+///     })
+/// }).collect();
+/// for worker in workers {
+///     worker.join().unwrap();
+/// }
+/// 
+/// assert_eq!(db.scan_prefix("worker:").count(), 4);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+/// 
+/// Operations that touch the log file (`put`, `get`, `delete`, `write_batch`,
+/// `compact` and the reads performed while iterating a [`Scan`]) are serialized
+/// by a single internal mutex, so they run one at a time, reads included. This
+/// keeps the design simple and consistent, but it means throughput does not grow
+/// with the number of threads. [`keys_with_prefix`](Self::keys_with_prefix) and the
+/// moment a scan is created only consult the in-memory index and do not wait for
+/// that mutex.
 pub struct DbStore {
     log: Mutex<LogManager>,
     index: KeyIndex,
@@ -17,6 +113,51 @@ pub struct DbStore {
 }
 
 impl DbStore {
+    /// Opens the store rooted at `path`, creating it if it does not exist.
+    /// 
+    /// `path` is a *directory*, not a file. It is created (together with any missing
+    /// parent directories) if absent, and it holds the log segments
+    /// (`0000000000.log`, `0000000001.log`, ...).
+    /// 
+    /// # Recovery
+    /// 
+    /// Opening replays every segment in order to rebuild the in-memory index, so
+    /// start-up time grows with the total size of the log (compacting keeps it
+    /// small). Within each segment, replay stops at the first frame that is
+    /// truncated, fails its checksum or cannot be decoded, and everything after it
+    /// in that segment is ignored. When the damage is in the newest segment (the
+    /// usual result of a crash in the middel of a write) a fresh segment is started,
+    /// so new writes never land after garbage. A batch that was only partially
+    /// written is discarded as a whole.
+    /// 
+    /// The operation counters reported by [`metrics`](Self::metrics) start from zero
+    /// on every open, while `live_keys` and `disk_size_bytes` reflect the recovered
+    /// state.
+    /// 
+    /// # Errors
+    /// 
+    /// * [`DbError::Io`] or [`DbError::PermissionDenied`] if the directory cannot be
+    ///   created or its files cannot be read or opened.
+    /// * [`DbError::Corruption`] if the recovered log contains a record that cannot be
+    ///   interpreted.
+    /// 
+    /// # Examples
+    /// 
+    /// Data survives closing and reopening the store:
+    /// 
+    /// ```
+    /// use rust_database::DbStore;
+    /// # let dir = tempfile::tempdir()?;
+    /// 
+    /// {
+    ///     let db = DbStore::open(dir.path())?;
+    ///     db.put(b"k".to_vec(), b"v".to_vec())?;
+    /// } // dropped: nothing to flush, every write was already fsynced
+    /// 
+    /// let db = DbStore::open(dir.path())?;
+    /// assert_eq!(db.get(b"k")?, b"v".to_vec());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_ref = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&path_ref)?;
@@ -57,6 +198,36 @@ impl DbStore {
         })
     }
 
+    /// Stores `value` under `key`, replacing any previous value.
+    /// 
+    /// The record is appended to the log and flushed with `fsync` before this method
+    /// returns. The replaced value stays on disk as dead space until the next
+    /// [`compact`](Self::compact). To write many entries at once, prefer
+    /// [`write_batch`](Self::write_batch): it pays for a single `fsync` and is atomic.
+    /// 
+    /// Empty keys and empty values are allowed.
+    /// 
+    /// # Errors
+    /// 
+    /// * [`DbError::Io`] or [`DbError::PermissionDenied`] if the write or the `fsync`
+    ///   fails. The partial write is rolled back on a best-effort basis and the index
+    ///   is left untouched, so the previous value (if any) is still the current one.
+    /// * [`DbError::Serialization`] if the record is too large to be framed (its
+    ///   encoded size must fit in 32 bits).
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use rust_database::DbStore;
+    /// # let dir = tempfile::tempdir()?;
+    /// let db = DbStore::open(dir.path())?;
+    /// 
+    /// db.put(b"counter".to_vec(), b"1".to_vec())?;
+    /// db.put(b"counter".to_vec(), b"2".to_vec())?; // overwrite
+    /// 
+    /// assert_eq!(db.get(b"counter")?, b"2".to_vec());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         let record = Record::new_put(key.clone(), value);
         let serialized = record.serialize()?;
@@ -71,6 +242,38 @@ impl DbStore {
         Ok(())
     }
 
+    /// Returns the current value stored under `key`.
+    /// 
+    /// Each call reads the record from disk and verifies its checksum; there is no
+    /// value cache. The call counts towards the `reads`, `get_hits` and `get_misses`
+    /// metrics.
+    /// 
+    /// # Errors
+    /// 
+    /// * [`DbError::KeyNotFound`] if the key does not exist (or was deleted). This is
+    ///   an ordinary outcome rather than a failure, so match on it explicitly.
+    /// * [`DbError::Io`] or [`DbError::UnexpectedEof`] if the record cannot be read.
+    /// * [`DbError::Corruption`] if the record fails its checksum or cannot be
+    ///   decoded.
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use rust_database::{DbError, DbStore};
+    /// # let dir = tempfile::tempdir()?;
+    /// let db = DbStore::open(dir.path())?;
+    /// db.put(b"user:42".to_vec(), b"ana".to_vec())?;
+    /// 
+    /// assert_eq!(db.get(b"user:42")?, b"ana".to_vec());
+    /// 
+    /// // A missing key is reported as `KeyNotFound`; other errors are real failures.
+    /// match db.get(b"user:43") {
+    ///     Ok(_) => unreachable!(),
+    ///     Err(DbError::KeyNotFound) => println!("no such user"),
+    ///     Err(other) => return Err(other.into()),
+    /// }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
         self.metrics.record_read();
 
@@ -115,12 +318,93 @@ impl DbStore {
         }
     }
 
+    /// Iterates over every entry whose key starts with `prefix`, in ascending key
+    /// order.
+    /// 
+    /// `prefix` can be anything that implements `AsRef<[u8]>`: a `&str`, a `String`,
+    /// a byte-string literal such as `b"user:"`, a `&[u8]` or a `Vec<u8>`. An empty
+    /// prefix matches every key.
+    /// 
+    /// The set of keys is captured when this method is called, and values are read
+    /// lazily as the returned [`Scan`] is advanced. No lock is held between items, so
+    /// a scan never blocks writers. See [`Scan`] for the precise snapshot semantics.
+    /// Each call counts as one scan in the metrics.
+    /// 
+    /// Choose your key layout so related entries share a prefix (for instance
+    /// `user:<id>` or `order:<customer>:<id>`); that is what makes this method cheap.
+    /// Note that `"user"` also matches `"users"`, so include the separator in the
+    /// prefix when you mean `"user:"`.
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use rust_database::DbStore;
+    /// # let dir = tempfile::tempdir()?;
+    /// let db = DbStore::open(dir.path())?;
+    /// db.put(b"user:2".to_vec(), b"david".to_vec())?;
+    /// db.put(b"user:1".to_vec(), b"ana".to_vec())?;
+    /// db.put(b"order:1".to_vec(), b"book".to_vec())?;
+    /// 
+    /// for entry in db.scan_prefix("user:") {
+    ///     let (key, value) = entry?;
+    ///     println!(
+    ///         "{} = {}",
+    ///         String::from_utf8_lossy(&key),
+    ///         String::from_utf8_lossy(&value)
+    ///     );
+    /// }
+    /// 
+    /// // Collect just the keys; the first I/O error aborts the collection.
+    /// let keys = db.scan_prefix("user:").map(|entry| entry.map(|(key, _value)| key))
+    ///     .collect::<Result<Vec<_>, _>>()?;
+    /// assert_eq!(keys, [b"user:1".to_vec(), b"user:2".to_vec()]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>) -> Scan<'_> {
         self.metrics.record_scan();
         let generation = self.generation.load(Ordering::Acquire);
         Scan::new(self, generation, self.index.scan_prefix(prefix.as_ref()))
     }
 
+    /// Iterates over every entry whose key lies inside `range`, in ascending key
+    /// order.
+    /// 
+    /// `range` can be any of the standard range types over byte-like keys
+    /// (`"a".."m"`, `"a"..="m"`, `"m"..`, `.."m"`) or an explicit
+    /// `(Bound, Bound)` pair, which is the way to express an exclusive start bound.
+    /// Keys are compared bytewise. An inverted range (start after end) simply yields
+    /// nothing; ir does not panic.
+    /// 
+    /// For a completely unbounded range (`..`) and for `(Bound, Bound)` pairs the
+    /// compiler cannot infer the key type, so spell it out:
+    /// `scan_range::<&str, _>(..)` (or use `scan_prefix("")` to scan everything).
+    /// 
+    /// Like [`scan_prefix`](Self::scan_prefix), the key set is captured when the
+    /// method is called, values are loaded lazily and the call counst as one scan.
+    /// See [`Scan`] for the snapshot semantics.
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use std::ops::Bound;
+    /// use rust_database::DbStore;
+    /// # let dir = tempfile::tempdir()?;
+    /// let db = DbStore::open(dir.path())?;
+    /// for key in ["a", "b", "c", "d", "e"] {
+    ///     db.put(key.as_bytes().to_vec(), key.to_uppercase().into_bytes())?;
+    /// }
+    /// 
+    /// assert_eq!(db.scan_range("b".."d").count(), 2); // b, c
+    /// assert_eq!(db.scan_range("b"..="d").count(), 3); // b, c, d
+    /// assert_eq!(db.scan_range("d"..).count(), 2); // d, e
+    /// assert_eq!(db.scan_range::<&str, _>(..).count(), 5); // everything
+    /// assert_eq!(db.scan_range("z".."a").count(), 0); // inverted: empty 
+    /// 
+    /// // Exclusive start bound: everything after "b".
+    /// let after_b = db.scan_range::<&str, _>((Bound::Excluded("b"), Bound::Unbounded));
+    /// assert_eq!(after_b.count(), 3); // c, d, e
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn scan_range<K, R>(&self, range: R) -> Scan<'_>
     where
         K: AsRef<[u8]>,
@@ -133,6 +417,28 @@ impl DbStore {
         Scan::new(self, generation, self.index.range(start, end))
     }
 
+    /// Returns the keys (without their values) that start with `prefix`, in ascending
+    /// order.
+    /// 
+    /// This is the cheapest way to list or count entries: it only consults the
+    /// in-memory index, performs no disk I/O, does not wait for the log mutex and is
+    /// not counted as a scan in the metrics. The whole result is materialized in a
+    /// `Vec`; use [`scan_prefix`](Self::scan_prefix) when you also need the values or
+    /// want to process entries one at a time.
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use rust_database::DbStore;
+    /// # let dir = tempfile::tempdir()?;
+    /// let db = DbStore::open(dir.path())?;
+    /// db.put(b"tag:b".to_vec(), vec![])?;
+    /// db.put(b"tag:a".to_vec(), vec![])?;
+    /// db.put(b"other".to_vec(), vec![])?;
+    /// 
+    /// assert_eq!(db.keys_with_prefix("tag:"), vec![b"tag:a".to_vec(), b"tag:b".to_vec()]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn keys_with_prefix(&self, prefix: impl AsRef<[u8]>) -> Vec<Vec<u8>> {
         self.index
             .scan_prefix(prefix.as_ref())
@@ -141,10 +447,70 @@ impl DbStore {
             .collect()
     }
 
+    /// Returns a point-in-time snapshot of the store's counters and gauges.
+    /// 
+    /// * **Counters** (`reads`, `puts`, `batches`, ...) count operations since this
+    ///   `DbStore` was opened and restart from zero on every [`open`](Self::open).
+    /// * **Gauges** (`live_keys`, `disk_size_bytes`) describe the current state and
+    ///   are rebuilt from the log when the store is opened. `disk_size_bytes` is the
+    ///   total size of all log segments, dead space included.
+    /// 
+    /// Taking a snapshot is cheap and never blocks. The fields are read one by one
+    /// without a lock, so a snapshot taken while other threads are writing can be
+    /// very slightly inconsistent between fields.
+    /// 
+    /// [`MetricsSnapshot::to_prometheus`] renders a snapshot in the Prometheus text
+    /// exposition format.
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use rust_database::DbStore;
+    /// # let dir = tempfile::tempdir()?;
+    /// let db = DbStore::open(dir.path())?;
+    /// 
+    /// db.put(b"a".to_vec(), b"1".to_vec())?;
+    /// db.get(b"a")?;
+    /// let _ = db.get(b"missing");
+    /// 
+    /// let m = db.metrics();
+    /// assert_eq!((m.puts, m.reads), (1, 2));
+    /// assert_eq!((m.get_hits, m.get_misses), (1, 1));
+    /// assert_eq!(m.get_hit_ratio(), Some(0.5));
+    /// assert_eq!(m.live_keys, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn metrics(&self) -> MetricsSnapshot {
         self.metrics.snapshot(self.index.len() as u64)
     }
 
+
+    /// Removes a `key` from the store.
+    /// 
+    /// A tombstone record is appended to the log and flushed with `fsync` before this
+    /// method returns, so the deletion is durable. The disk space of the removed
+    /// value is only reclaimed by [`compact`](Self::compact).
+    /// 
+    /// # Errors
+    /// 
+    /// * [`DbError::KeyNotFound`] if the key does not exist. Nothing is written in
+    ///   that case. If you want "delete if present" semantics, either ignore this
+    ///   error or use a [`WriteBatch`], where deleting a missing key is not an error.
+    /// * [`DbError::Io`] or [`DbError::PermissionDenied`] if the write or the `fsync`
+    ///   fails; the key then remains in place.
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use rust_database::{DbError, DbStore};
+    /// # let dir = tempfile::tempdir()?;
+    /// let db = DbStore::open(dir.path())?;
+    /// db.put(b"session".to_vec(), b"abc".to_vec())?;
+    /// 
+    /// db.delete(b"session".to_vec())?;
+    /// assert!(matches!(db.get(b"session"), Err(DbError::KeyNotFound)));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn delete(&self, key: Vec<u8>) -> Result<()> {
         let mut log = self.log.lock().unwrap();
         if self.index.get(&key).is_none() {
@@ -161,6 +527,57 @@ impl DbStore {
         Ok(())
     }
 
+    /// Applies every operation in `batch` atomically.
+    /// 
+    /// The operations take effect in the order they were added to the batch, so a
+    /// later operation on a key wins over an earlier one (`put` then `delete` leaves
+    /// the key deleted; `delete` then `put` leaves it present).
+    /// 
+    /// * **Atomic on disk.** The whole batch is written as one checksummed unit. I
+    ///   the process crashes mid-write, recovery discards the batch entirely.
+    /// * **Atomic in memory.** The index is updated in a single step while the log
+    ///   mutex is held, so concurrent `get`s, scans and
+    ///   [`keys_with_prefix`](Self::keys_with_prefix) calls see either none or all of
+    ///   the batch.
+    /// * **Fast.** The batch costs one `fsync` regardless of its size, far fewer than
+    ///   the same number of individual [`put`](Self::put) calls.
+    /// 
+    /// An empty batch is a successful no-op and is not counted in the metrics.
+    /// Deleting a key that does not exist is *not* an error inside a batch. Batches
+    /// count as one `batches` plus `n` `batch_ops` in the metrics (they do not
+    /// increment `puts` or `deletes`).
+    /// 
+    /// # Errors
+    /// 
+    /// * [`DbError::Io`] or [`DbError::PermissionDenied`] if the write or the `fsync`
+    ///   fails.
+    /// * [`DbError::Serialization`] if a record is too large to be framed or the batch
+    ///   holds more operations than fit in 32 bits.
+    /// 
+    /// On error nothing is applied to the index.
+    /// 
+    /// # Examples
+    /// 
+    /// Move a balance between two accounts so that no reader (and no crash) can ever
+    /// see the money in both places or in neither:
+    /// 
+    /// ```
+    /// use rust_database::{DbStore, WriteBatch};
+    /// # let dir = tempfile::tempdir()?;
+    /// let db = DbStore::open(dir.path())?;
+    /// db.put(b"account:david".to_vec(), b"100".to_vec())?;
+    /// db.put(b"account:ana".to_vec(), b"50".to_vec())?;
+    /// db.put(b"pending:transfer-7".to_vec(), b"david->ana:10".to_vec())?;
+    /// 
+    /// let mut batch = WriteBatch::new();
+    /// batch.put("account:david", "90").put("account:ana", "60").delete("pending:transfer-7");
+    /// db.write_batch(batch)?;
+    /// 
+    /// assert_eq!(db.get(b"account:david")?, b"90".to_vec());
+    /// assert_eq!(db.get(b"account:ana")?, b"60".to_vec());
+    /// assert!(db.keys_with_prefix("pending:").is_empty());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -210,6 +627,64 @@ impl DbStore {
         Ok(())
     }
 
+    /// Reclaims the disk space used by overwritten and deleted entries.
+    /// 
+    /// Compaction copies every live record into fresh segments, switches the index
+    /// over to the copies and then deletes the old segments. Nothing runs
+    /// automatically, so call this yourself when
+    /// [`metrics`](Self::metrics)`().disk_size_bytes` has grown well beyond the size
+    /// of your live data, typically after many overwrites or deletes. It also bounds
+    /// start-up time, since [`open`](Self::open) replays the whole log.
+    /// 
+    /// # Cost
+    /// 
+    /// Compaction holds the log mutex for its whole duration, so **every other
+    /// operation that touches the log (including `get`) waits for it to finish**.
+    /// The work is proportional to the amount of *live* data, not to the log size.
+    /// Schedule it for quiet moments, or run it from a dedicated maintenance thread.
+    /// 
+    /// # Crash safety
+    /// 
+    /// The new segments are flushed (and the directory synced) before any old
+    /// segment is removed. A crash in between leaves both generations on disk;
+    /// recovery replays them in order and arrives at the same state, and the next
+    /// call to `compact` removes the leftovers.
+    /// 
+    /// # Interaction with scans
+    /// 
+    /// A [`Scan`] created before a compaction keeps working, but its remaining
+    /// items are then resolved against the current index instead of the snapshot;
+    /// see [`Scan`] for the details.
+    /// 
+    /// # Errors
+    /// 
+    /// * [`DbError::Io`] or [`DbError::PermissionDenied`] if copying or syncing fails.
+    ///   The store then keeps serving its previous state.
+    /// * The same errors if deleting the old segments fails. In that case the
+    ///   compaction itself has already taken effect and no data is at risk; calling
+    ///   `compact` again removes the leftovers.
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use rust_database::DbStore;
+    /// # let dir = tempfile::tempdir()?;
+    /// let db = DbStore::open(dir.path())?;
+    /// 
+    /// // Rewriting one key 50 times leaves 49 dead versions in the log.
+    /// for i in 0..50 {
+    ///     db.put(b"hot".to_vec(), format!("v{i}").into_bytes())?;
+    /// }
+    /// let before = db.metrics().disk_size_bytes;
+    /// 
+    /// db.compact()?;
+    /// 
+    /// let after = db.metrics();
+    /// assert!(after.disk_size_bytes < before);
+    /// assert_eq!(after.compactions, 1);
+    /// assert_eq!(db.get(b"hot")?, b"v49".to_vec());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn compact(&self) -> Result<()> {
         let mut log = self.log.lock().unwrap();
 
@@ -244,6 +719,65 @@ impl DbStore {
     }
 }
 
+/// A lazy iterator over the entries selected by
+/// [`DbStore::scan_prefix`] or [`DbStore::scan_range`].
+/// 
+/// Each item is a `Result<(key, value)>` with both parts as owned `Vec<u8>`.
+/// Entries come in ascending key order, and the iterator is also a
+/// [`DoubleEndedIterator`] (use `.rev()` or `next_back()` to walk from the
+/// largest key down) and an [`ExactSizeIterator`] (`len()` is the number of
+/// entries not yet yielded).
+/// 
+/// # Snapshot semantics
+/// 
+/// * **The set of keys is fixed when the scan is created.** Keys inserted
+///   afterwards never appear. The snapshot is consistent with respect to
+///   [`write_batch`](DbStore::write_batch): a batch is either entirely inside it
+///   or entirely outside.
+/// * **Values are read lazily**, one per call to `next`, so scanning a huge range
+///   and stopping early only pays for the entries you actually consume (for
+///   example `scan.rev().take(10)` reads ten values).
+/// * **Overwrites and deletes after creation are not seen.** An entry yields the
+///   value it had when the scan was created, even if the key has since been
+///   overwriten or deleted.
+/// * **Compaction weakens that guarantee.** Compaction deletes the old log
+///   segments the snapshot points into, so if [`compact`](DbStore::compact) runs
+///   while a scan is still being consumed, the scan re-resolves each remaining
+///   key against the current idex: it then yields the *current* value, and a key
+///   that was deleted in the meantime yields `Err(`[`DbError::KeyNotFound`]`)`.
+///   Items yielded before the compaction are unaffected.
+/// * **Errors are per item.** An I/O error or a corrupted record is reported as
+///   an `Err` for that entry only; the iterator is not fused and later entries can
+///   still succeed. Use `collect::<Result<Vec_>, _>>()` to stop at the first
+///   error.
+/// 
+/// A `Scan` borrows its [`DbStore`] and holds no lock between items, so it never
+/// blocks writers (and you cannot drop the store while a scan is alive).
+/// 
+/// # Examples
+/// 
+/// ```
+/// use rust_database::DbStore;
+/// # let dir = tempfile::tempdir()?;
+/// let db = DbStore::open(dir.path())?;
+/// db.put(b"k1".to_vec(), b"old".to_vec())?;
+/// db.put(b"k2".to_vec(), b"old".to_vec())?;
+/// 
+/// let scan = db.scan_prefix("k");
+/// 
+/// // None of these writes is visible to the scan created above.
+/// db.put(b"k1".to_vec(), b"new".to_vec())?;
+/// db.delete(b"k2".to_vec())?;
+/// db.put(b"k3".to_vec(), b"late".to_vec())?;
+/// 
+/// let seen = scan.collect::<Result<Vec<_>, _>>()?;
+/// assert_eq!(seen, [(b"k1".to_vec(), b"old".to_vec()), (b"k2".to_vec(), b"old".to_vec())]);
+/// 
+/// // A fresh scan sees the current state; `.rev()` walks from the largest key.
+/// let newest_first = db.scan_prefix("k").rev().map(|entry| entry.map(|(key, _)| key)).collect::<Result<Vec<_>, _>>()?;
+/// assert_eq!(newest_first, [b"k3".to_vec(), b"k1".to_vec()]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub struct Scan<'a> {
     db: &'a DbStore,
     generation: u64,
