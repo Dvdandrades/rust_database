@@ -103,12 +103,18 @@ impl MetricsSnapshot {
             let _ = writeln!(out, "{prefix}_{name} {value}");
         };
 
-        metric("reads_total", "counter", "Calss to get.", self.reads);
+        metric("reads_total", "counter", "Calls to get.", self.reads);
         metric(
             "get_hits_total",
             "counter",
             "Gets that found the key.",
             self.get_hits,
+        );
+        metric(
+            "get_misses_total",
+            "counter",
+            "Gets that did not found the key.",
+            self.get_misses,
         );
         metric(
             "scans_total",
@@ -136,7 +142,7 @@ impl MetricsSnapshot {
             self.batch_ops,
         );
         metric(
-            "compactions total",
+            "compactions_total",
             "counter",
             "Completed compactions.",
             self.compactions,
